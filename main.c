@@ -1,10 +1,32 @@
+#include <stdint.h>
 #include <stdio.h>
 #include <fcntl.h>
+#include <sys/types.h>
+#include <time.h>
 #include <unistd.h>
 #include <linux/cdrom.h>
 #include <sys/ioctl.h>
 #include <stdlib.h>
+#include <pthread.h>
+#include <alsa/asoundlib.h>
+#include <stdatomic.h>
 
+typedef struct {
+    int16_t *buf;
+    size_t capacity;
+    size_t mask;
+    atomic_size_t write;
+    atomic_size_t read;
+} ringbuffer;
+
+struct Player {
+    ringbuffer rb;
+
+    pthread_mutex_t mu;
+    struct cdrom_read_audio *ra;
+    int fd;
+    int playing;
+};
 
 struct Track {
     int start_lba;
@@ -13,10 +35,56 @@ struct Track {
     int track_num;
 };
 
-const int FRAME_SIZE = 2352;
-const int N_FRAMES = 25;
+const uint FRAME_SIZE = 2352;
+const uint N_FRAMES = 25;
+const uint RB_SIZE = 262144; // 2 ^ 18
 
-int main() {
+// return number of samples written
+size_t player_write(struct Player *player, int16_t *samples, size_t num_samples) {
+    ringbuffer* rb = &player->rb;
+
+    size_t w = atomic_load(&rb->write);
+    size_t r = atomic_load(&rb->read);
+    size_t free_space = rb->capacity - (w - r);
+
+    if (num_samples > free_space) {
+        printf("%d, %d\n", num_samples, free_space);
+        return 0;
+    }
+
+    for (size_t i = 0; i < num_samples; i++) {
+        // goofy math
+        rb->buf[(w + i) & rb->mask] = samples[i];
+    }
+
+    atomic_store(&rb->write, w + num_samples);
+    return num_samples;
+}
+
+// returns number of samples read into *samples
+size_t rb_read(struct Player *player, int16_t *samples, size_t num_samples) {
+    ringbuffer* rb = &player->rb;
+
+    size_t w = atomic_load(&rb->write);
+    size_t r = atomic_load(&rb->read);
+    size_t available = w - r;
+    
+    if (num_samples > available) {
+        num_samples = available;
+    }
+
+    for (size_t i = 0; i < num_samples; i++) {
+        samples[i] = rb->buf[(r + i) & rb->mask];
+    }
+
+    atomic_store(&rb->read, r + num_samples);
+    return num_samples;
+}
+
+
+// fetch header from CD
+// caller has to free tracks
+int _init_header(struct Track** tracks, size_t* tracks_len) {
     int fd = open("/dev/sr0", O_RDONLY | O_NONBLOCK);
     
     struct cdrom_tochdr hdr;
@@ -24,9 +92,12 @@ int main() {
 
     const int FIRST_TRACK = hdr.cdth_trk0;
     const int LAST_TRACK = hdr.cdth_trk1;
-    const int NUM_TRACKS = (LAST_TRACK - FIRST_TRACK + 1);
+    const size_t NUM_TRACKS = (LAST_TRACK - FIRST_TRACK + 1);
     
-    struct Track *tracks = malloc(NUM_TRACKS * sizeof(struct Track));
+    *tracks_len = NUM_TRACKS;
+    *tracks = malloc(NUM_TRACKS * sizeof(struct Track));
+
+    struct Track *t = *tracks;
 
     int i = 0;
     for (int trackNum = hdr.cdth_trk0; trackNum <= hdr.cdth_trk1; trackNum++) {
@@ -42,65 +113,165 @@ int main() {
         printf("    Format: %d\n", entry.cdte_format);
         printf("    Data mode: %d\n", entry.cdte_datamode);
 
-        tracks[i].start_lba = entry.cdte_addr.lba;
-        tracks[i].track_num = trackNum;
+        t[i].start_lba = entry.cdte_addr.lba;
+        t[i].track_num = trackNum;
         if (i > 0) {
-            tracks[i-1].end_lba = entry.cdte_addr.lba; 
-            tracks[i-1].num_frames = tracks[i-1].end_lba - tracks[i-1].start_lba;
+            t[i-1].end_lba = entry.cdte_addr.lba; 
+            t[i-1].num_frames = t[i-1].end_lba - t[i-1].start_lba;
         }
         i++;
     }
 
-    // special case for the last entry
+    // special case for the last entry, use CDROM_LEADOUT
     struct cdrom_tocentry entry;
     entry.cdte_track = CDROM_LEADOUT;
     entry.cdte_format = CDROM_LBA;
     ioctl(fd, CDROMREADTOCENTRY, &entry);
-    tracks[NUM_TRACKS - 1].end_lba = entry.cdte_addr.lba;
-    tracks[NUM_TRACKS - 1].num_frames = tracks[NUM_TRACKS - 1].end_lba - tracks[NUM_TRACKS - 1].start_lba;
+    t[NUM_TRACKS - 1].end_lba = entry.cdte_addr.lba;
+    t[NUM_TRACKS - 1].num_frames = t[NUM_TRACKS - 1].end_lba - t[NUM_TRACKS - 1].start_lba;
     
-    for (int i = 0; i<NUM_TRACKS; i++) {
-        printf("READING track: %d\n", tracks[i].track_num);
-        
-        // stuff we don't change
-        struct cdrom_read_audio ra;
-        ra.addr_format = CDROM_LBA;
-        ra.buf = malloc(N_FRAMES * FRAME_SIZE);
-        
-        // stuff we change
-        ra.addr.lba = -1;
-        ra.nframes = -1;
-
-        // step through the frames
-        for (int j = tracks[i].start_lba; j+N_FRAMES < tracks[i].end_lba; j+=N_FRAMES) {
-            // printf("ITERATING\n");
-            ra.addr.lba = j;
-            ra.nframes = N_FRAMES;
-            ioctl(fd, CDROMREADAUDIO, &ra);
-            
-            // cast to samples
-            int16_t *samples = (int16_t *)ra.buf;
-            int16_t left_0  = samples[0];
-            // print the first sample
-            printf("%d\n", left_0);
-        }
-
-        // now print whatever frames are left
-        int frames_left = tracks[i].num_frames % N_FRAMES;
-        ra.addr.lba = tracks[i].end_lba - frames_left;
-        ra.nframes = frames_left;
-        ioctl(fd, CDROMREADAUDIO, &ra);
-        for (int j = 0; j < frames_left * FRAME_SIZE; j++) {
-            printf("%02x ", ra.buf[j]);
-        }
-        
-        free(ra.buf);
-
-        printf("\n\n");
+    int err = close(fd);
+    if (err != 0) {
+        return 1;
     }
 
-    int err = close(fd);
-    printf("%d\n", err);
-    printf("%d\n", fd);
+    return 0;
+}
+
+void _destroy_header(struct Track* tracks) {
+    free(tracks);
+}
+
+int _init_player(struct Player** player) {
+    *player = malloc(sizeof(struct Player));
+    struct Player *p = *player;
+
+    // ring buffer
+    p->rb.buf = malloc(sizeof(int16_t) * RB_SIZE);
+    p->rb.capacity = RB_SIZE;
+    p->rb.mask = RB_SIZE - 1; // index % capacity is the same as index & mask
+
+    pthread_mutex_init(&p->mu, NULL);
+    p->fd = open("/dev/sr0", O_RDONLY | O_NONBLOCK);
+    p->playing = 0; // false
+
+    // read audio struct gets reused like my ex
+    p->ra = malloc(sizeof(struct cdrom_read_audio));
+    p->ra->buf = malloc(N_FRAMES * FRAME_SIZE);
+    p->ra->addr_format = CDROM_LBA;
+    p->ra->nframes = -1;
+    p->ra->addr.lba = -1;
+
+    return 0;
+}
+
+int _destroy_player(struct Player* p) {
+    struct Player* player = p;
+
+    free(player->rb.buf);
+    int err = pthread_mutex_destroy(&player->mu);
+    if (err != 0) {
+        return 1;
+    }
+    close(player->fd);
+    if (err != 0) {
+        return 1;
+    }
+    free(player->ra->buf);
+    free(player->ra);
+    free(player);
+    
+    return 0;
+}
+
+int play_samples(int16_t* samples, size_t num_frames) {
+    snd_pcm_t *pcm;
+    
+    int err = snd_pcm_open(&pcm, "default", SND_PCM_STREAM_PLAYBACK, 0);
+    if (err != 0) {
+        return 1;
+    }
+    
+    // hard code rate to 44100 cuz its a CD wallahi
+    err = snd_pcm_set_params(pcm, SND_PCM_FORMAT_S16_LE, SND_PCM_ACCESS_RW_INTERLEAVED, 2, 44100, 1, 500000);
+    if (err != 0) {
+        snd_pcm_close(pcm);
+        return 1;
+    }
+
+    snd_pcm_sframes_t written = snd_pcm_writei(pcm, samples, num_frames);
+    
+    if(written < 0) {
+        written = snd_pcm_recover(pcm, written, 0);
+        if (written < 0) {
+            return 1;
+        }
+    } else if((u_long) written < num_frames) {
+        return 1;
+    }
+
+    snd_pcm_drain(pcm);
+    snd_pcm_close(pcm);
+
+    return 0;
+}
+
+int play(struct Track track, struct Player* player) {
+    int err;
+
+    pthread_mutex_lock(&player->mu);
+    player->playing = 1;
+    pthread_mutex_unlock(&player->mu);
+    
+    struct Track t = track;
+    for (int j = track.start_lba; j+N_FRAMES < track.end_lba; j+=N_FRAMES) {
+        player->ra->addr.lba = j;
+        player->ra->nframes = N_FRAMES;
+        err = ioctl(player->fd, CDROMREADAUDIO, player->ra);
+        if (err != 0) {
+            return 1;
+        }
+
+        // cast to samples
+        int16_t *samples = (int16_t *)player->ra->buf;
+        int num_samples = (N_FRAMES * FRAME_SIZE) / sizeof(int16_t);
+
+        printf("CALLING PLAY_SAMPLES\n");
+        player_write(player, samples, num_samples);
+    }
+
+    // now play whatever frames are left
+    int frames_left = track.num_frames % N_FRAMES;
+    player->ra->addr.lba = track.end_lba - frames_left;
+    player->ra->nframes = frames_left;
+    err = ioctl(player->fd, CDROMREADAUDIO, player->ra);
+    if (err != 0) {
+        return 1;
+    }
+
+    int16_t *samples = (int16_t *) player->ra->buf;
+    int num_samples = (frames_left * FRAME_SIZE) / sizeof(int16_t);
+    player_write(player, samples, num_samples);
+
+    return 0;
+}
+
+int main() {
+    int err;
+
+    struct Track* tracks;
+    size_t num_tracks;
+    _init_header(&tracks, &num_tracks);
+
+    struct Player* player; 
+    _init_player(&player);
+
+    err = play(tracks[1], player);
+    if (err != 0) {
+        printf("PLAYER ERROR\n");
+    }
+    _destroy_player(player);
+    _destroy_header(tracks);
+
     return 0;
 }
