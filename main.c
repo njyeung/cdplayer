@@ -11,6 +11,14 @@
 #include <alsa/asoundlib.h>
 #include <stdatomic.h>
 
+
+struct Track {
+    int start_lba;
+    int end_lba;
+    int num_frames;
+    int track_num;
+};
+
 typedef struct {
     int16_t *buf;
     size_t capacity;
@@ -22,17 +30,18 @@ typedef struct {
 struct Player {
     ringbuffer rb;
 
-    pthread_mutex_t mu;
     struct cdrom_read_audio *ra;
     int fd;
-    int playing;
-};
+    
+    snd_pcm_t* pcm;
 
-struct Track {
-    int start_lba;
-    int end_lba;
-    int num_frames;
-    int track_num;
+    struct Track* current_track; 
+
+    pthread_t consumer_thread;
+    pthread_t producer_thread;
+
+    atomic_size_t playing;
+    atomic_size_t quit;
 };
 
 const uint FRAME_SIZE = 2352;
@@ -41,6 +50,7 @@ const uint RB_SIZE = 262144; // 2 ^ 18
 
 // return number of samples written
 size_t player_write(struct Player *player, int16_t *samples, size_t num_samples) {
+tryagain:
     ringbuffer* rb = &player->rb;
 
     size_t w = atomic_load(&rb->write);
@@ -48,8 +58,8 @@ size_t player_write(struct Player *player, int16_t *samples, size_t num_samples)
     size_t free_space = rb->capacity - (w - r);
 
     if (num_samples > free_space) {
-        printf("%d, %d\n", num_samples, free_space);
-        return 0;
+        usleep(1000);
+        goto tryagain;
     }
 
     for (size_t i = 0; i < num_samples; i++) {
@@ -62,7 +72,7 @@ size_t player_write(struct Player *player, int16_t *samples, size_t num_samples)
 }
 
 // returns number of samples read into *samples
-size_t rb_read(struct Player *player, int16_t *samples, size_t num_samples) {
+size_t player_read(struct Player *player, int16_t *samples, size_t num_samples) {
     ringbuffer* rb = &player->rb;
 
     size_t w = atomic_load(&rb->write);
@@ -81,6 +91,53 @@ size_t rb_read(struct Player *player, int16_t *samples, size_t num_samples) {
     return num_samples;
 }
 
+int play_samples(struct Player* player, int16_t* samples, size_t num_frames) {
+    num_frames = num_frames/2; // alsa wants divided by 2 for stereo
+
+    snd_pcm_sframes_t written = snd_pcm_writei(player->pcm, samples, num_frames);
+    if(written < 0) {
+        written = snd_pcm_recover(player->pcm, written, 0);
+        if (written < 0) {
+            return 1;
+        }
+    } else if((u_long) written < num_frames) {
+        return 1;
+    }
+
+    return 0;
+}
+
+void* consumer(void* args) {
+    struct Player* player = (struct Player *) args;
+    
+    const int BUF_SIZE = (N_FRAMES * FRAME_SIZE) / sizeof(int16_t);
+    int16_t *buf = malloc(sizeof(int16_t) * BUF_SIZE);
+    for(;;) {
+        atomic_size_t quit = atomic_load(&player->quit);
+        if (quit == 1) break;
+
+        atomic_size_t playing = atomic_load(&player->playing);
+        if (playing == 0) {
+            usleep(1000);
+            continue;
+        }
+        size_t num_read = player_read(player, buf, BUF_SIZE);
+        if (num_read == 0) {
+            usleep(1000);
+        } else {
+            play_samples(player, buf,num_read);
+        }
+    }
+
+    free(buf);
+    
+}
+
+void* producer(void* args) {
+    struct Player* player = (struct Player*) args;
+
+    // MAN WTF MAN WTF
+}
 
 // fetch header from CD
 // caller has to free tracks
@@ -151,9 +208,8 @@ int _init_player(struct Player** player) {
     p->rb.capacity = RB_SIZE;
     p->rb.mask = RB_SIZE - 1; // index % capacity is the same as index & mask
 
-    pthread_mutex_init(&p->mu, NULL);
     p->fd = open("/dev/sr0", O_RDONLY | O_NONBLOCK);
-    p->playing = 0; // false
+    atomic_store(&p->playing, 0); // false
 
     // read audio struct gets reused like my ex
     p->ra = malloc(sizeof(struct cdrom_read_audio));
@@ -162,18 +218,43 @@ int _init_player(struct Player** player) {
     p->ra->nframes = -1;
     p->ra->addr.lba = -1;
 
+    // init pcm
+    int err = snd_pcm_open(&p->pcm, "default", SND_PCM_STREAM_PLAYBACK, 0);
+    if (err != 0) {
+        return 1;
+    }
+    // hard code rate to 44100 cuz its a CD wallahi
+    err = snd_pcm_set_params(p->pcm, SND_PCM_FORMAT_S16_LE, SND_PCM_ACCESS_RW_INTERLEAVED, 2, 44100, 1, 500000);
+    if (err != 0) {
+        snd_pcm_close(p->pcm);
+        return 1;
+    }
+
+    atomic_store(&p->quit, 0);
+    // init consumer thread, bro exists just to consume the ring buffer
+    pthread_create(&p->consumer_thread, NULL, consumer, p);
+
+    // init producer thread
+    pthread_create(&p->producer_thread, NULL, producer, p);
+
     return 0;
 }
 
 int _destroy_player(struct Player* p) {
     struct Player* player = p;
+    
+    // join thread
+    atomic_store(&p->quit, 1);
+    pthread_join(p->consumer_thread, NULL);
+    pthread_join(p->producer_thread, NULL);
 
+    // drain and close pcm
+    snd_pcm_drain(player->pcm);
+    snd_pcm_close(player->pcm);
+
+    // free ring buffer
     free(player->rb.buf);
-    int err = pthread_mutex_destroy(&player->mu);
-    if (err != 0) {
-        return 1;
-    }
-    close(player->fd);
+    int err = close(player->fd);
     if (err != 0) {
         return 1;
     }
@@ -184,45 +265,11 @@ int _destroy_player(struct Player* p) {
     return 0;
 }
 
-int play_samples(int16_t* samples, size_t num_frames) {
-    snd_pcm_t *pcm;
-    
-    int err = snd_pcm_open(&pcm, "default", SND_PCM_STREAM_PLAYBACK, 0);
-    if (err != 0) {
-        return 1;
-    }
-    
-    // hard code rate to 44100 cuz its a CD wallahi
-    err = snd_pcm_set_params(pcm, SND_PCM_FORMAT_S16_LE, SND_PCM_ACCESS_RW_INTERLEAVED, 2, 44100, 1, 500000);
-    if (err != 0) {
-        snd_pcm_close(pcm);
-        return 1;
-    }
-
-    snd_pcm_sframes_t written = snd_pcm_writei(pcm, samples, num_frames);
-    
-    if(written < 0) {
-        written = snd_pcm_recover(pcm, written, 0);
-        if (written < 0) {
-            return 1;
-        }
-    } else if((u_long) written < num_frames) {
-        return 1;
-    }
-
-    snd_pcm_drain(pcm);
-    snd_pcm_close(pcm);
-
-    return 0;
-}
-
 int play(struct Track track, struct Player* player) {
     int err;
 
-    pthread_mutex_lock(&player->mu);
-    player->playing = 1;
-    pthread_mutex_unlock(&player->mu);
-    
+    atomic_store(&player->playing, 1);
+
     struct Track t = track;
     for (int j = track.start_lba; j+N_FRAMES < track.end_lba; j+=N_FRAMES) {
         player->ra->addr.lba = j;
