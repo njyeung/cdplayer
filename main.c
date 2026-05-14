@@ -10,7 +10,7 @@
 #include <pthread.h>
 #include <alsa/asoundlib.h>
 #include <stdatomic.h>
-
+#include <stdbool.h>
 
 struct Track {
     int start_lba;
@@ -35,22 +35,31 @@ struct Player {
     
     snd_pcm_t* pcm;
 
-    struct Track* current_track; 
+    pthread_mutex_t track_mu;
+    struct Track* current_track;
+    int current_lba;
 
     pthread_t consumer_thread;
     pthread_t producer_thread;
 
-    atomic_size_t playing;
-    atomic_size_t quit;
+    atomic_bool playing;
+    atomic_bool quit;
 };
 
 const uint FRAME_SIZE = 2352;
 const uint N_FRAMES = 25;
 const uint RB_SIZE = 262144; // 2 ^ 18
 
-// return number of samples written
+// echos the number of samples written, or 0 if stopped or quit 
 size_t player_write(struct Player *player, int16_t *samples, size_t num_samples) {
 tryagain:
+
+    bool quit = atomic_load(&player->quit);
+    bool playing = atomic_load(&player->playing);
+    if (quit || playing == false ) {
+        return 0;
+    }
+
     ringbuffer* rb = &player->rb;
 
     size_t w = atomic_load(&rb->write);
@@ -95,14 +104,9 @@ int play_samples(struct Player* player, int16_t* samples, size_t num_frames) {
     num_frames = num_frames/2; // alsa wants divided by 2 for stereo
 
     snd_pcm_sframes_t written = snd_pcm_writei(player->pcm, samples, num_frames);
-    if(written < 0) {
-        written = snd_pcm_recover(player->pcm, written, 0);
-        if (written < 0) {
-            return 1;
-        }
-    } else if((u_long) written < num_frames) {
-        return 1;
-    }
+    while (written < 0) {
+        written = snd_pcm_recover(player->pcm, written, 1);
+    } 
 
     return 0;
 }
@@ -112,18 +116,23 @@ void* consumer(void* args) {
     
     const int BUF_SIZE = (N_FRAMES * FRAME_SIZE) / sizeof(int16_t);
     int16_t *buf = malloc(sizeof(int16_t) * BUF_SIZE);
-    for(;;) {
-        atomic_size_t quit = atomic_load(&player->quit);
-        if (quit == 1) break;
 
-        atomic_size_t playing = atomic_load(&player->playing);
-        if (playing == 0) {
+    for(;;) {
+        bool quit = atomic_load(&player->quit);
+        if (quit) {
+            break;
+        }
+
+        bool playing = atomic_load(&player->playing);
+        if (playing == false) {
             usleep(1000);
             continue;
         }
+
         size_t num_read = player_read(player, buf, BUF_SIZE);
         if (num_read == 0) {
             usleep(1000);
+            continue;
         } else {
             play_samples(player, buf,num_read);
         }
@@ -135,8 +144,61 @@ void* consumer(void* args) {
 
 void* producer(void* args) {
     struct Player* player = (struct Player*) args;
+    struct Track* prev_track = NULL;
 
-    // MAN WTF MAN WTF
+    for (;;) {
+        bool quit = atomic_load(&player->quit);
+        if (quit) {
+            break;
+        }
+
+        bool playing = atomic_load(&player->playing);
+        if (playing == false) {
+            usleep(1000);
+            continue;
+        }
+        
+        pthread_mutex_lock(&player->track_mu);
+
+        // This is a messy solution since playing isn't mutated inside of the lock...
+        if (player->current_track == NULL || player->current_lba == -1) {
+            pthread_mutex_unlock(&player->track_mu);
+            continue;
+        }
+
+        if(player->current_lba + N_FRAMES <= player->current_track->end_lba) {
+            player->ra->addr.lba = player->current_lba;
+            player->ra->nframes = N_FRAMES;
+
+            ioctl(player->fd, CDROMREADAUDIO, player->ra);
+            
+            // cast to samples
+            int16_t *samples = (int16_t *)player->ra->buf;
+            int num_samples = (N_FRAMES * FRAME_SIZE) / sizeof(int16_t);
+
+            player_write(player, samples, num_samples);
+
+            player->current_lba += N_FRAMES;
+        } else if (player->current_lba <= player->current_track->end_lba) { // play whatever frames are left
+            int frames_left = player->current_track->num_frames % N_FRAMES;
+            player->ra->addr.lba = player->current_track->end_lba - frames_left;
+            player->ra->nframes = frames_left;
+            ioctl(player->fd, CDROMREADAUDIO, player->ra);
+
+            int16_t *samples = (int16_t *) player->ra->buf;
+            int num_samples = (frames_left * FRAME_SIZE) / sizeof(int16_t);
+            
+            player_write(player, samples, num_samples);
+
+            player->current_lba += frames_left;
+        } else { // we reached the end, current_lba is >= current_track's end_lba
+            atomic_store(&player->playing, false);
+            player->current_track = NULL;
+            player->current_lba = -1;
+        } 
+        
+        pthread_mutex_unlock(&player->track_mu);
+    }
 }
 
 // fetch header from CD
@@ -209,7 +271,12 @@ int _init_player(struct Player** player) {
     p->rb.mask = RB_SIZE - 1; // index % capacity is the same as index & mask
 
     p->fd = open("/dev/sr0", O_RDONLY | O_NONBLOCK);
-    atomic_store(&p->playing, 0); // false
+    
+    // tracks
+    atomic_store(&p->playing, false); // false
+    pthread_mutex_init(&p->track_mu, NULL);
+    p->current_track = NULL;
+    p->current_lba = -1;
 
     // read audio struct gets reused like my ex
     p->ra = malloc(sizeof(struct cdrom_read_audio));
@@ -230,7 +297,7 @@ int _init_player(struct Player** player) {
         return 1;
     }
 
-    atomic_store(&p->quit, 0);
+    atomic_store(&p->quit, false);
     // init consumer thread, bro exists just to consume the ring buffer
     pthread_create(&p->consumer_thread, NULL, consumer, p);
 
@@ -244,7 +311,7 @@ int _destroy_player(struct Player* p) {
     struct Player* player = p;
     
     // join thread
-    atomic_store(&p->quit, 1);
+    atomic_store(&p->quit, true);
     pthread_join(p->consumer_thread, NULL);
     pthread_join(p->producer_thread, NULL);
 
@@ -265,44 +332,31 @@ int _destroy_player(struct Player* p) {
     return 0;
 }
 
-int play(struct Track track, struct Player* player) {
-    int err;
+int play(struct Track* track, struct Player* player) {
 
-    atomic_store(&player->playing, 1);
+    pthread_mutex_lock(&player->track_mu);
+    player->current_track = track;
+    player->current_lba = track->start_lba;
+    pthread_mutex_unlock(&player->track_mu);
 
-    struct Track t = track;
-    for (int j = track.start_lba; j+N_FRAMES < track.end_lba; j+=N_FRAMES) {
-        player->ra->addr.lba = j;
-        player->ra->nframes = N_FRAMES;
-        err = ioctl(player->fd, CDROMREADAUDIO, player->ra);
-        if (err != 0) {
-            return 1;
-        }
-
-        // cast to samples
-        int16_t *samples = (int16_t *)player->ra->buf;
-        int num_samples = (N_FRAMES * FRAME_SIZE) / sizeof(int16_t);
-
-        printf("CALLING PLAY_SAMPLES\n");
-        player_write(player, samples, num_samples);
-    }
-
-    // now play whatever frames are left
-    int frames_left = track.num_frames % N_FRAMES;
-    player->ra->addr.lba = track.end_lba - frames_left;
-    player->ra->nframes = frames_left;
-    err = ioctl(player->fd, CDROMREADAUDIO, player->ra);
-    if (err != 0) {
-        return 1;
-    }
-
-    int16_t *samples = (int16_t *) player->ra->buf;
-    int num_samples = (frames_left * FRAME_SIZE) / sizeof(int16_t);
-    player_write(player, samples, num_samples);
+    atomic_store(&player->playing, true);
 
     return 0;
 }
 
+int stop(struct Player* player) {
+
+    atomic_store(&player->playing, false);
+
+    pthread_mutex_lock(&player->track_mu);
+    player->current_track = NULL;
+    player->current_lba = -1;
+
+    // advance read pointer of ring buffer past old data
+    atomic_store(&player->rb.read, atomic_load(&player->rb.write));
+
+    pthread_mutex_unlock(&player->track_mu);
+}
 int main() {
     int err;
 
@@ -313,10 +367,27 @@ int main() {
     struct Player* player; 
     _init_player(&player);
 
-    err = play(tracks[1], player);
+    err = play(&tracks[1], player);
     if (err != 0) {
         printf("PLAYER ERROR\n");
     }
+
+    sleep(5);
+
+    stop(player);
+
+    printf("STOPPED PLAYER\n");
+
+    sleep(5);
+
+    printf("TRYING TO PLAY SECOND TRACK\n");
+    err = play(&tracks[2], player);
+    if (err != 0) {
+        printf("PLAYER ERROR\n");
+    }
+
+    sleep(12);
+
     _destroy_player(player);
     _destroy_header(tracks);
 
