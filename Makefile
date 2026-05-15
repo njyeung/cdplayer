@@ -1,2 +1,2 @@
 default:
-	gcc main.c -o main -lasound
+	gcc main.c cJSON.c -o main -lasound -lcrypto -lcurl

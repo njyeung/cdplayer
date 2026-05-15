@@ -7,16 +7,27 @@
 #include <linux/cdrom.h>
 #include <sys/ioctl.h>
 #include <stdlib.h>
+#include <string.h>
 #include <pthread.h>
 #include <alsa/asoundlib.h>
 #include <stdatomic.h>
 #include <stdbool.h>
+#include <openssl/sha.h>
+#include <openssl/bio.h>
+#include <openssl/evp.h>
+#include <curl/curl.h>
+
+#include "cJSON.h"
 
 struct Track {
     int start_lba;
     int end_lba;
     int num_frames;
     int track_num;
+    int length_us;
+
+    char* title;
+    char** artists;
 };
 
 typedef struct {
@@ -32,7 +43,8 @@ struct Player {
 
     struct cdrom_read_audio *ra;
     int fd;
-    
+    _Atomic(float) volume;
+
     snd_pcm_t* pcm;
 
     pthread_mutex_t track_mu;
@@ -100,8 +112,15 @@ size_t player_read(struct Player *player, int16_t *samples, size_t num_samples) 
     return num_samples;
 }
 
+// it mutates the samples buffer btw
 int play_samples(struct Player* player, int16_t* samples, size_t num_frames) {
     num_frames = num_frames/2; // alsa wants divided by 2 for stereo
+    
+    float vol = atomic_load(&player->volume);
+    for (int16_t i = 0; i < num_frames * 2; i++) {
+        samples[i] = (int16_t)(samples[i] * vol);
+    }
+
 
     snd_pcm_sframes_t written = snd_pcm_writei(player->pcm, samples, num_frames);
     while (written < 0) {
@@ -192,15 +211,39 @@ void* producer(void* args) {
 
             player->current_lba += frames_left;
         } else { // we reached the end, current_lba is >= current_track's end_lba
-            atomic_store(&player->playing, false);
+
             player->current_track = NULL;
             player->current_lba = -1;
+
+            atomic_store(&player->playing, false);
         } 
         
         pthread_mutex_unlock(&player->track_mu);
     }
 }
 
+// I found this online breh
+static const char hex[] = "0123456789ABCDEF";
+static void write_hex(char *dst, unsigned int val, int digits) {
+    for (int i = digits - 1; i >= 0; i--) {
+        dst[i] = hex[val & 0xf];
+        val >>= 4;
+    }
+}
+
+// curl response buffer
+struct mem_buf { char *data; size_t size; };
+static size_t curl_write_cb(void *ptr, size_t size, size_t nmemb, void *userdata) {
+    size_t real = size * nmemb;
+    struct mem_buf *m = userdata;
+    char *p = realloc(m->data, m->size + real + 1);
+    if (!p) return 0;
+    m->data = p;
+    memcpy(m->data + m->size, ptr, real);
+    m->size += real;
+    m->data[m->size] = '\0';
+    return real;
+}
 // fetch header from CD
 // caller has to free tracks
 int _init_header(struct Track** tracks, size_t* tracks_len) {
@@ -224,19 +267,13 @@ int _init_header(struct Track** tracks, size_t* tracks_len) {
         entry.cdte_track = trackNum;
         entry.cdte_format = CDROM_LBA;
         ioctl(fd, CDROMREADTOCENTRY, &entry);
-        
-        printf("=== TRACK %d ===\n", entry.cdte_track);
-        printf("    Starting LBA: %d\n", entry.cdte_addr.lba);
-        printf("    Starting MSF: %d\n", entry.cdte_addr.msf);
-        printf("    CTRL: %d\n", entry.cdte_ctrl);
-        printf("    Format: %d\n", entry.cdte_format);
-        printf("    Data mode: %d\n", entry.cdte_datamode);
 
         t[i].start_lba = entry.cdte_addr.lba;
         t[i].track_num = trackNum;
         if (i > 0) {
             t[i-1].end_lba = entry.cdte_addr.lba; 
             t[i-1].num_frames = t[i-1].end_lba - t[i-1].start_lba;
+            t[i-1].length_us = ((uint64_t)t[i-1].num_frames * (uint64_t)1000000) / (uint64_t)75;
         }
         i++;
     }
@@ -248,16 +285,135 @@ int _init_header(struct Track** tracks, size_t* tracks_len) {
     ioctl(fd, CDROMREADTOCENTRY, &entry);
     t[NUM_TRACKS - 1].end_lba = entry.cdte_addr.lba;
     t[NUM_TRACKS - 1].num_frames = t[NUM_TRACKS - 1].end_lba - t[NUM_TRACKS - 1].start_lba;
-    
+    t[NUM_TRACKS - 1].length_us = ((uint64_t)t[NUM_TRACKS - 1].num_frames * (uint64_t)1000000) / (uint64_t)75;
+
     int err = close(fd);
     if (err != 0) {
         return 1;
     }
 
+
+    char string[2 + 2 + 100 * 8];
+    memset(string, '0', sizeof(string));
+    // first track number
+    write_hex(string, t[0].track_num, 2);
+    // last track number
+    write_hex(string + 2, t[NUM_TRACKS - 1].track_num, 2);
+    
+    // slot 0 has lead out offset
+    write_hex(string + 4, t[NUM_TRACKS - 1].end_lba + 150, 8);
+    
+    // slots 1-99 are filled with the offsets of each track
+    for (int j = 0; j<NUM_TRACKS; j++) {
+        write_hex(string + 4 + t[j].track_num * 8, t[j].start_lba + 150, 8);
+    }
+
+    unsigned char hash[SHA_DIGEST_LENGTH];
+    SHA1(string, sizeof(string), hash);
+
+    // EVP_EncodeBlock writes 28 chars + NUL for a 20-byte SHA1
+    unsigned char base64enc[29];
+    EVP_EncodeBlock(base64enc, hash, SHA_DIGEST_LENGTH);
+
+    for (int j = 0; j < 28; j++) {
+        switch (base64enc[j]) {
+            case '+': base64enc[j] = '.'; break;
+            case '/': base64enc[j] = '_'; break;
+            case '=': base64enc[j] = '-'; break;
+        }
+    }
+
+    char url[128];
+    snprintf(url, sizeof(url), "https://musicbrainz.org/ws/2/discid/%s?fmt=json&inc=recordings+artists", base64enc);
+    printf("%s\n", url);
+    
+    for (size_t k = 0; k < NUM_TRACKS; k++) {
+        t[k].title = NULL;
+        t[k].artists = NULL;
+    }
+
+    // fetch metadata from MusicBrainz
+    struct mem_buf chunk = { .data = malloc(1), .size = 0 };
+    chunk.data[0] = '\0';
+
+    curl_global_init(CURL_GLOBAL_ALL);
+    CURL *curl = curl_easy_init();
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "cdplayer/0.1 ( https://github.com/njyeung/cdplayer )");
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_write_cb);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &chunk);
+    CURLcode res = curl_easy_perform(curl);
+    curl_easy_cleanup(curl);
+    curl_global_cleanup();
+
+    if (res != CURLE_OK) {
+        free(chunk.data);
+        return 0;
+    }
+
+    cJSON *root = cJSON_Parse(chunk.data);
+    free(chunk.data);
+
+    cJSON *releases = cJSON_GetObjectItem(root, "releases");
+    cJSON *release0 = cJSON_GetArrayItem(releases, 0);
+    cJSON *media = cJSON_GetObjectItem(release0, "media");
+    cJSON *media0 = cJSON_GetArrayItem(media, 0);
+    cJSON *json_trks = cJSON_GetObjectItem(media0, "tracks");
+
+    if (json_trks) {
+        int n = cJSON_GetArraySize(json_trks);
+        if ((size_t)n > NUM_TRACKS) n = NUM_TRACKS;
+
+        for (int k = 0; k < n; k++) {
+
+            cJSON *jt = cJSON_GetArrayItem(json_trks, k);
+            cJSON *title = cJSON_GetObjectItem(jt, "title");
+            
+            if (title && cJSON_IsString(title)) {
+                t[k].title = strdup(title->valuestring);
+            }
+
+            cJSON *credits = cJSON_GetObjectItem(jt, "artist-credit");
+            int nc = cJSON_GetArraySize(credits);
+
+            t[k].artists = malloc(sizeof(char *) * (nc + 1));
+
+            for (int c = 0; c < nc; c++) {
+                cJSON *ce = cJSON_GetArrayItem(credits, c);
+                cJSON *nm = cJSON_GetObjectItem(ce, "name");
+                t[k].artists[c] = (nm && cJSON_IsString(nm)) ? strdup(nm->valuestring) : strdup("");
+            }
+            t[k].artists[nc] = NULL;
+        }
+    }
+
+    cJSON_Delete(root);
+
+    for (size_t k = 0; k < NUM_TRACKS; k++) {
+        printf("%s\n", t[k].title ? t[k].title : "(unknown)");
+        printf("    Start LBA:   %d\n", t[k].start_lba);
+        printf("    End LBA:     %d\n", t[k].end_lba);
+        printf("    Num frames:  %d\n", t[k].num_frames);
+        printf("    Length (us): %d\n", t[k].length_us);
+        printf("    Artists:    ");
+        if (t[k].artists) {
+            for (char **a = t[k].artists; *a; a++) printf(" %s", *a);
+        }
+        printf("\n");
+    }
+
     return 0;
 }
 
-void _destroy_header(struct Track* tracks) {
+void _destroy_header(struct Track* tracks, size_t tracks_len) {
+    for (size_t i = 0; i < tracks_len; i++) {
+        free(tracks[i].title);
+        if (tracks[i].artists) {
+            for (char **a = tracks[i].artists; *a; a++) free(*a);
+            free(tracks[i].artists);
+        }
+    }
     free(tracks);
 }
 
@@ -271,7 +427,8 @@ int _init_player(struct Player** player) {
     p->rb.mask = RB_SIZE - 1; // index % capacity is the same as index & mask
 
     p->fd = open("/dev/sr0", O_RDONLY | O_NONBLOCK);
-    
+    atomic_store(&p->volume, 1.0);
+
     // tracks
     atomic_store(&p->playing, false); // false
     pthread_mutex_init(&p->track_mu, NULL);
@@ -332,19 +489,18 @@ int _destroy_player(struct Player* p) {
     return 0;
 }
 
-int play(struct Track* track, struct Player* player) {
+void play(struct Player* player, struct Track* track) {
+
+    atomic_store(&player->playing, true);
 
     pthread_mutex_lock(&player->track_mu);
     player->current_track = track;
     player->current_lba = track->start_lba;
     pthread_mutex_unlock(&player->track_mu);
 
-    atomic_store(&player->playing, true);
-
-    return 0;
 }
 
-int stop(struct Player* player) {
+void stop(struct Player* player) {
 
     atomic_store(&player->playing, false);
 
@@ -356,40 +512,67 @@ int stop(struct Player* player) {
     atomic_store(&player->rb.read, atomic_load(&player->rb.write));
 
     pthread_mutex_unlock(&player->track_mu);
+    
 }
+
+// 1 = no disk in tray
+// 2 = tray open
+// 3 = reading tray
+// 4 = disk in tray
+static int tray_status() {
+    int fd = open("/dev/sr0", O_RDONLY | O_NONBLOCK);
+    int ret = ioctl(fd,0x5326);
+    close(fd);
+    return ret;
+}
+
+
+void set_volume(struct Player* player, float vol) {
+    if(vol > 1.0 || vol < 0.0) {
+        return;
+    }
+    
+    atomic_store(&player->volume, vol);
+}
+
 int main() {
-    int err;
+    for (;;) {
+        while(tray_status() != 4) {
+            sleep(1);
+            // spin
+        }
 
-    struct Track* tracks;
-    size_t num_tracks;
-    _init_header(&tracks, &num_tracks);
+        struct Track* tracks;
+        size_t num_tracks;
+        _init_header(&tracks, &num_tracks);
 
-    struct Player* player; 
-    _init_player(&player);
+        struct Player* player; 
+        _init_player(&player);
 
-    err = play(&tracks[1], player);
-    if (err != 0) {
-        printf("PLAYER ERROR\n");
+        set_volume(player, 1);
+
+        for (int i = 0; i<num_tracks; i++) {
+
+            play(player, &tracks[i]);
+
+            printf("PLAYING: %s\n", tracks[i].title);
+
+            int status;
+            while(atomic_load(&player->playing) && (status = tray_status()) == 4) {
+                sleep(1);
+            }
+            if (status == 0) { // track ended, play the next song 
+                stop(player);
+            } else if (status == 1) { // cd player was opened
+                stop(player);
+                break;
+            }
+        }
+
+        _destroy_player(player);
+        _destroy_header(tracks, num_tracks);
     }
-
-    sleep(5);
-
-    stop(player);
-
-    printf("STOPPED PLAYER\n");
-
-    sleep(5);
-
-    printf("TRYING TO PLAY SECOND TRACK\n");
-    err = play(&tracks[2], player);
-    if (err != 0) {
-        printf("PLAYER ERROR\n");
-    }
-
-    sleep(12);
-
-    _destroy_player(player);
-    _destroy_header(tracks);
+    
 
     return 0;
 }
