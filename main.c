@@ -12,6 +12,7 @@
 #include <alsa/asoundlib.h>
 #include <stdatomic.h>
 #include <stdbool.h>
+#include <errno.h>
 #include <openssl/sha.h>
 #include <openssl/bio.h>
 #include <openssl/evp.h>
@@ -248,9 +249,13 @@ static size_t curl_write_cb(void *ptr, size_t size, size_t nmemb, void *userdata
 // caller has to free tracks
 int _init_header(struct Track** tracks, size_t* tracks_len) {
     int fd = open("/dev/sr0", O_RDONLY | O_NONBLOCK);
-    
+    if (fd < 0) {
+        perror("open /dev/sr0");
+        return 1;
+    }
     struct cdrom_tochdr hdr;
-    ioctl(fd, CDROMREADTOCHDR, &hdr);
+    if (ioctl(fd, CDROMREADTOCHDR, &hdr) < 0) { perror("CDROMREADTOCHDR"); return 1; }
+    fprintf(stderr, "TOC hdr: first=%d last=%d\n", hdr.cdth_trk0, hdr.cdth_trk1);
 
     const int FIRST_TRACK = hdr.cdth_trk0;
     const int LAST_TRACK = hdr.cdth_trk1;
@@ -266,7 +271,9 @@ int _init_header(struct Track** tracks, size_t* tracks_len) {
         struct cdrom_tocentry entry;
         entry.cdte_track = trackNum;
         entry.cdte_format = CDROM_LBA;
-        ioctl(fd, CDROMREADTOCENTRY, &entry);
+        if (ioctl(fd, CDROMREADTOCENTRY, &entry) < 0) {
+            fprintf(stderr, "CDROMREADTOCENTRY track %d: %s\n", trackNum, strerror(errno));
+        }
 
         t[i].start_lba = entry.cdte_addr.lba;
         t[i].track_num = trackNum;
@@ -282,7 +289,9 @@ int _init_header(struct Track** tracks, size_t* tracks_len) {
     struct cdrom_tocentry entry;
     entry.cdte_track = CDROM_LEADOUT;
     entry.cdte_format = CDROM_LBA;
-    ioctl(fd, CDROMREADTOCENTRY, &entry);
+    if (ioctl(fd, CDROMREADTOCENTRY, &entry) < 0) {
+        fprintf(stderr, "CDROMREADTOCENTRY leadout: %s\n", strerror(errno));
+    }
     t[NUM_TRACKS - 1].end_lba = entry.cdte_addr.lba;
     t[NUM_TRACKS - 1].num_frames = t[NUM_TRACKS - 1].end_lba - t[NUM_TRACKS - 1].start_lba;
     t[NUM_TRACKS - 1].length_us = ((uint64_t)t[NUM_TRACKS - 1].num_frames * (uint64_t)1000000) / (uint64_t)75;
@@ -339,7 +348,6 @@ int _init_header(struct Track** tracks, size_t* tracks_len) {
     curl_global_init(CURL_GLOBAL_ALL);
     CURL *curl = curl_easy_init();
     curl_easy_setopt(curl, CURLOPT_URL, url);
-    curl_easy_setopt(curl, CURLOPT_USERAGENT, "cdplayer/0.1 ( https://github.com/njyeung/cdplayer )");
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_write_cb);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &chunk);
