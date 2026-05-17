@@ -12,7 +12,6 @@
 #include <alsa/asoundlib.h>
 #include <stdatomic.h>
 #include <stdbool.h>
-#include <errno.h>
 #include <openssl/sha.h>
 #include <openssl/bio.h>
 #include <openssl/evp.h>
@@ -254,8 +253,7 @@ int _init_header(struct Track** tracks, size_t* tracks_len) {
         return 1;
     }
     struct cdrom_tochdr hdr;
-    if (ioctl(fd, CDROMREADTOCHDR, &hdr) < 0) { perror("CDROMREADTOCHDR"); return 1; }
-    fprintf(stderr, "TOC hdr: first=%d last=%d\n", hdr.cdth_trk0, hdr.cdth_trk1);
+    ioctl(fd, CDROMREADTOCHDR, &hdr);
 
     const int FIRST_TRACK = hdr.cdth_trk0;
     const int LAST_TRACK = hdr.cdth_trk1;
@@ -271,9 +269,7 @@ int _init_header(struct Track** tracks, size_t* tracks_len) {
         struct cdrom_tocentry entry;
         entry.cdte_track = trackNum;
         entry.cdte_format = CDROM_LBA;
-        if (ioctl(fd, CDROMREADTOCENTRY, &entry) < 0) {
-            fprintf(stderr, "CDROMREADTOCENTRY track %d: %s\n", trackNum, strerror(errno));
-        }
+        ioctl(fd, CDROMREADTOCENTRY, &entry);
 
         t[i].start_lba = entry.cdte_addr.lba;
         t[i].track_num = trackNum;
@@ -289,9 +285,7 @@ int _init_header(struct Track** tracks, size_t* tracks_len) {
     struct cdrom_tocentry entry;
     entry.cdte_track = CDROM_LEADOUT;
     entry.cdte_format = CDROM_LBA;
-    if (ioctl(fd, CDROMREADTOCENTRY, &entry) < 0) {
-        fprintf(stderr, "CDROMREADTOCENTRY leadout: %s\n", strerror(errno));
-    }
+    ioctl(fd, CDROMREADTOCENTRY, &entry);
     t[NUM_TRACKS - 1].end_lba = entry.cdte_addr.lba;
     t[NUM_TRACKS - 1].num_frames = t[NUM_TRACKS - 1].end_lba - t[NUM_TRACKS - 1].start_lba;
     t[NUM_TRACKS - 1].length_us = ((uint64_t)t[NUM_TRACKS - 1].num_frames * (uint64_t)1000000) / (uint64_t)75;
