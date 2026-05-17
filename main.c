@@ -342,7 +342,7 @@ int _init_header(struct Track** tracks, size_t* tracks_len) {
     curl_global_init(CURL_GLOBAL_ALL);
     CURL *curl = curl_easy_init();
     curl_easy_setopt(curl, CURLOPT_URL, url);
-    curl_easy_setopt(curl, CURLOPT_USERAGENT, "cdplayer/0.1 ( nickjyeung@gmail.com )");
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "cdplayer/0.1 ( https://github.com/njyeung/cdplayer )");
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_write_cb);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &chunk);
